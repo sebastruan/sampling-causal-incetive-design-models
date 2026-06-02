@@ -1,0 +1,65 @@
+# ==============================================================================
+# Causal Incentive Design Models (CIDM) - Reproducible Simulation Framework
+# Requirements: PyTorch, Pandas, Scikit-Learn, Numpy, Matplotlib
+# ==============================================================================
+
+import torch
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from torch.quasirandom import SobolEngine
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.metrics import root_mean_squared_error
+import warnings
+warnings.filterwarnings('ignore')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Executing on: {device}")
+
+# ------------------------------------------------------------------------------
+# 1. Feature Map Generators & RKHS Sampler
+# ------------------------------------------------------------------------------
+def generate_rff_features(X, D, sigma, use_qmc=False, seed=42):
+    """Generates finite feature map Z(x) using MC or QMC."""
+    N, input_dim = X.shape
+    if use_qmc:
+        sobol = SobolEngine(dimension=input_dim + 1, scramble=True, seed=seed)
+        u = sobol.draw(D).to(device)
+        u_omega, u_b = u[:, :-1], u[:, -1:]
+        b = 2 * math.pi * u_b
+        # Inverse CDF for Normal distribution (clamped for numerical stability)
+        u_omega_clamped = torch.clamp(u_omega, 1e-6, 1.0 - 1e-6)
+        omega = (math.sqrt(2.0) * torch.erfinv(2.0 * u_omega_clamped - 1.0)) / sigma
+        omega, b = omega.t(), b.t()
+    else:
+        torch.manual_seed(seed)
+        omega = torch.randn((input_dim, D), device=device) / sigma
+        b = 2 * math.pi * torch.rand((1, D), device=device)
+
+    projection = torch.matmul(X, omega)
+    Z = math.sqrt(2.0 / D) * torch.cos(projection + b)
+    return Z, omega, b
+
+class RKHS_Sampler:
+    """Samples standalone callable functions from the RKHS."""
+    def __init__(self, D, sigma, use_qmc, device):
+        self.D, self.sigma, self.use_qmc, self.device = D, sigma, use_qmc, device
+        self.seed_counter = 42
+
+    def sample_function(self):
+        dummy_X = torch.zeros((1, 1), device=self.device)
+        _, omega, b = generate_rff_features(dummy_X, self.D, self.sigma, self.use_qmc, self.seed_counter)
+        self.seed_counter += 1
+
+        w = torch.randn((self.D, 1), device=self.device)
+
+        def f(x):
+            if not isinstance(x, torch.Tensor):
+                x = torch.tensor(x, dtype=torch.float32, device=self.device)
+            if x.dim() == 1:
+                x = x.unsqueeze(-1)
+            projection = torch.matmul(x, omega)
+            Z = math.sqrt(2.0 / self.D) * torch.cos(projection + b)
+            return torch.matmul(Z, w).squeeze(-1)
+        return f
