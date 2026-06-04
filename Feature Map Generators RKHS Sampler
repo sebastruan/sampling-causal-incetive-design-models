@@ -1,7 +1,9 @@
-# ==============================================================================
-# Causal Incentive Design Models (CIDM) - Reproducible Simulation Framework
+# ===============================================================================================
+# Finite Dimensional Approximations of Incentive Functions for Causal Incentive Design Models  
+# Reproducible Simulation Framework
 # Requirements: PyTorch, Pandas, Scikit-Learn, Numpy, Matplotlib
-# ==============================================================================
+# ================================================================================================
+
 
 import torch
 import math
@@ -16,6 +18,7 @@ warnings.filterwarnings('ignore')
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Executing on: {device}")
+
 
 # ------------------------------------------------------------------------------
 # 1. Feature Map Generators & RKHS Sampler
@@ -63,3 +66,194 @@ class RKHS_Sampler:
             Z = math.sqrt(2.0 / self.D) * torch.cos(projection + b)
             return torch.matmul(Z, w).squeeze(-1)
         return f
+
+
+# ------------------------------------------------------------------------------
+# 2. Optimization and Structural Equations
+# ------------------------------------------------------------------------------
+def compute_argmax(f, bounds, device, res=2000, lr=0.05, epochs=100):
+    """Solves Follower's Best Response via Grid Search + Autograd Fine-tuning."""
+    a, b = bounds
+    grid = torch.linspace(a, b, res, device=device).unsqueeze(1)
+    with torch.no_grad():
+        y_grid = f(grid)
+
+    best_x = grid[torch.argmax(y_grid)].clone().requires_grad_(True)
+    optimizer = torch.optim.Adam([best_x], lr=lr)
+
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        loss = -f(best_x) # Minimize negative utility to Maximize
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            best_x.clamp_(a, b)
+
+    return best_x.item()
+
+def compute_true_baseline(pap_type, gamma_func, wF_star, sigma_wF, device, bounds):
+    """High-precision integration over follower's structural noise."""
+    eps_wF = torch.randn(5000, device=device) * sigma_wF
+    wF_exec = torch.clamp(torch.tensor(wF_star) + eps_wF, bounds[0], bounds[1])
+
+    with torch.no_grad():
+        expected_gamma = gamma_func(wF_exec).mean().item()
+
+    if pap_type == "labor":
+        return 3.0 * wF_star - expected_gamma
+    elif pap_type == "supply":
+        return 4.0 * wF_star - expected_gamma
+
+def get_utilities(pap_type, wL, wF):
+    if pap_type == "labor":
+        return wL - 0.5*(wF**2), 3.0*wF - wL
+    elif pap_type == "supply":
+        return wL - (wF**2), 4.0*wF - wL
+
+
+# ------------------------------------------------------------------------------
+# 3. Experiment Execution Loops
+# ------------------------------------------------------------------------------
+def run_experiment_1():
+    print("--- Running Experiment 1 (Kernel Approximation Error) ---")
+    sigma = 1.5
+    X_grid = torch.linspace(0.0, 5.0, 200, device=device).unsqueeze(1)
+
+    # Exact Analytical RBF Kernel
+    X_norm = (X_grid ** 2).sum(1).view(-1, 1)
+    sq_dist = X_norm + X_norm.t() - 2.0 * torch.mm(X_grid, X_grid.t())
+    K_exact = torch.exp(-sq_dist / (2 * sigma ** 2))
+
+    D_values = [10, 50, 100, 500, 1000]
+    results = []
+
+    for D in D_values:
+        mc_mses, qmc_mses = [], []
+        for s in range(10): # Average over multiple seeds for statistical stability
+            Z_mc, _, _ = generate_rff_features(X_grid, D, sigma, use_qmc=False, seed=s)
+            Z_qmc, _, _ = generate_rff_features(X_grid, D, sigma, use_qmc=True, seed=s)
+
+            mc_mses.append(torch.mean((K_exact - torch.mm(Z_mc, Z_mc.t()))**2).item())
+            qmc_mses.append(torch.mean((K_exact - torch.mm(Z_qmc, Z_qmc.t()))**2).item())
+
+        results.append({'D': D, 'MC MSE': np.mean(mc_mses), 'QMC MSE': np.mean(qmc_mses)})
+
+    return pd.DataFrame(results)
+
+def run_experiment_2():
+    print("\n--- Running Experiment 2 (Estimation Convergence) ---")
+    bounds = (0.0, 5.0)
+    sigma_wF = 0.1
+    N_values = [100, 500, 1000, 2000]
+
+    results = []
+    for pap in ["labor", "supply"]:
+        for use_qmc in [False, True]:
+            sampler = RKHS_Sampler(D=50, sigma=1.5, use_qmc=use_qmc, device=device)
+            eval_grid = torch.linspace(bounds[0], bounds[1], 50, device=device).unsqueeze(1)
+
+            X_data, y_target, v_true = [], [], []
+            for _ in range(max(N_values) + 200): # Max train size + 200 out-of-sample test points
+                func = sampler.sample_function()
+                with torch.no_grad():
+                    X_data.append(func(eval_grid).cpu().numpy().flatten())
+
+                # 1. Follower's Best Response
+                def exp_JF(wF):
+                    jf, _ = get_utilities(pap, func(wF), wF)
+                    return jf
+                wF_star = compute_argmax(exp_JF, bounds, device)
+
+                # 2. Structural Observational Execution
+                wF_exec = torch.clamp(torch.tensor(wF_star) + torch.randn(1)*sigma_wF, bounds[0], bounds[1])
+                wL_exec = func(wF_exec) + torch.randn(1)*0.2
+                _, jL = get_utilities(pap, wL_exec, wF_exec)
+                y_target.append(jL.item() + (torch.randn(1)*0.05).item())
+
+                # 3. True Analytical V(gamma) calculation
+                v_true.append(compute_true_baseline(pap, func, wF_star, sigma_wF, device, bounds))
+
+            X_all, y_all, v_all = np.vstack(X_data), np.array(y_target), np.array(v_true)
+            X_test, y_test_true = X_all[-200:], v_all[-200:]
+
+            for N in N_values:
+                X_train, y_train = X_all[:N], y_all[:N]
+                krr = KernelRidge(alpha=0.1, kernel='rbf', gamma=0.01)
+                krr.fit(X_train, y_train)
+                preds = krr.predict(X_test)
+
+                rmse = root_mean_squared_error(y_test_true, preds)
+                results.append({'Scenario': pap, 'Method': 'QMC' if use_qmc else 'MC', 'N': N, 'RMSE': rmse})
+
+    return pd.DataFrame(results)
+
+
+# ------------------------------------------------------------------------------
+# 4. Visualization Functions
+# ------------------------------------------------------------------------------
+def plot_experiment_1(df_exp1):
+    """Generates a log-log coordinate graph of the approximation decay."""
+    plt.figure(figsize=(8, 5))
+
+    # Plotting MC and QMC errors
+    plt.plot(df_exp1['D'], df_exp1['MC MSE'], marker='o', linestyle='--', label='Monte Carlo (MC)')
+    plt.plot(df_exp1['D'], df_exp1['QMC MSE'], marker='s', linestyle='-', label='Quasi-Monte Carlo (QMC)')
+
+    # Setting both axes to logarithmic scale
+    plt.xscale('log')
+    plt.yscale('log')
+
+    plt.xlabel('Approximation Dimension D (log scale)')
+    plt.ylabel('Mean Squared Error (log scale)')
+    plt.title('Experiment 1: RKHS Feature Map Approximation Error')
+    plt.legend()
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+def plot_experiment_2(df_exp2):
+    """Visualizes the findings as logarithmic RMSE convergence curves."""
+    plt.figure(figsize=(10, 6))
+
+    # Separate data by scenario and method
+    labor_mc = df_exp2[(df_exp2['Scenario'] == 'labor') & (df_exp2['Method'] == 'MC')]
+    labor_qmc = df_exp2[(df_exp2['Scenario'] == 'labor') & (df_exp2['Method'] == 'QMC')]
+    supply_mc = df_exp2[(df_exp2['Scenario'] == 'supply') & (df_exp2['Method'] == 'MC')]
+    supply_qmc = df_exp2[(df_exp2['Scenario'] == 'supply') & (df_exp2['Method'] == 'QMC')]
+
+    # Plot Labor Economics
+    plt.plot(labor_mc['N'], labor_mc['RMSE'], marker='o', linestyle='--', color='blue', label='Labor - MC')
+    plt.plot(labor_qmc['N'], labor_qmc['RMSE'], marker='s', linestyle='-', color='blue', label='Labor - QMC')
+
+    # Plot Supply Chain
+    plt.plot(supply_mc['N'], supply_mc['RMSE'], marker='^', linestyle='--', color='red', label='Supply Chain - MC')
+    plt.plot(supply_qmc['N'], supply_qmc['RMSE'], marker='d', linestyle='-', color='red', label='Supply Chain - QMC')
+
+    # Setting axes to logarithmic scale to visualize convergence rates
+    plt.xscale('log')
+    plt.yscale('log')
+
+    plt.xlabel('Dataset Size N (log scale)')
+    plt.ylabel('RMSE of V(γ) (log scale)')
+    plt.title('Experiment 2: Estimation Convergence of Causal Target')
+    plt.legend()
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------------------------------------------------------
+# 5. Execution Block
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Run Experiment 1 and plot
+    df_exp1 = run_experiment_1()
+    print("\nTable 1 Output:")
+    print(df_exp1.to_string(index=False))
+    plot_experiment_1(df_exp1)
+
+    # Run Experiment 2 and plot
+    df_exp2 = run_experiment_2()
+    print("\nTable 2 Output:")
+    print(df_exp2.to_string(index=False))
+    plot_experiment_2(df_exp2)
